@@ -1,4 +1,5 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { supabase } from './lib/supabase';
 // VERSION: GOLD_SERVICES_V2_FINAL_SYNC
 import { motion, AnimatePresence } from 'framer-motion';
 import {
@@ -9,7 +10,9 @@ import {
   BookOpen,
   Menu,
   Coins,
-  X
+  X,
+  Eye,
+  EyeOff
 } from 'lucide-react';
 
 interface LoanOption {
@@ -64,6 +67,121 @@ function App() {
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [notificationHistory, setNotificationHistory] = useState<{ name: string; amount: string; time: string }[]>([]);
   const [copiedNumber, setCopiedNumber] = useState<string | null>(null);
+  const [isAdminOpen, setIsAdminOpen] = useState(false);
+  const [isAdminAuthenticated, setIsAdminAuthenticated] = useState(false);
+  const [activeAdminTab, setActiveAdminTab] = useState<'overview' | 'video' | 'gallery' | 'logs'>('overview');
+  const [adminLoginForm, setAdminLoginForm] = useState({ username: '', password: '' });
+  const [showAdminPassword, setShowAdminPassword] = useState(false);
+  const [videoFileUrl, setVideoFileUrl] = useState<string | null>(null);
+  const [videoLinkUrl, setVideoLinkUrl] = useState<string>("");
+  const [isVideoLoading, setIsVideoLoading] = useState(true);
+  const [isAutoplayEnabled, setIsAutoplayEnabled] = useState(true);
+  const [isVolumeEnabled, setIsVolumeEnabled] = useState(true);
+  const [adminFiles, setAdminFiles] = useState<{ type: 'photo' | 'video', name: string, status: 'uploading' | 'done', data?: string }[]>([]);
+
+  // Ref do elemento de vídeo para controlo de autoplay por scroll
+  const videoRef = useRef<HTMLVideoElement>(null);
+
+  // IntersectionObserver: inicia o vídeo quando fica visível no ecrã
+  useEffect(() => {
+    const videoEl = videoRef.current;
+    if (!videoEl || !isAutoplayEnabled) return;
+
+    // Função para tentar dar play com ou sem som
+    const attemptPlay = async () => {
+      try {
+        // Primeiro tenta com o som configurado
+        videoEl.muted = !isVolumeEnabled;
+        await videoEl.play();
+      } catch (err) {
+        console.log("Autoplay with sound blocked, falling back to muted:", err);
+        // Se falhar (quase sempre falha com som sem interação), tenta muted para garantir playback
+        videoEl.muted = true;
+        await videoEl.play().catch(e => console.log("Muted autoplay also failed:", e));
+      }
+    };
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        entries.forEach((entry) => {
+          if (entry.isIntersecting) {
+            attemptPlay();
+          } else {
+            videoEl.pause();
+          }
+        });
+      },
+      { 
+        threshold: 0.3,
+        rootMargin: "0px"
+      }
+    );
+
+    // Listener global para "destrancar" o som na primeira interação
+    const handleFirstInteraction = () => {
+      if (isVolumeEnabled && videoEl && videoEl.muted) {
+        videoEl.muted = false;
+        videoEl.play().catch(() => {});
+      }
+      window.removeEventListener('mousedown', handleFirstInteraction);
+      window.removeEventListener('touchstart', handleFirstInteraction);
+      window.removeEventListener('keydown', handleFirstInteraction);
+    };
+
+    window.addEventListener('mousedown', handleFirstInteraction);
+    window.addEventListener('touchstart', handleFirstInteraction);
+    window.addEventListener('keydown', handleFirstInteraction);
+
+    observer.observe(videoEl);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener('mousedown', handleFirstInteraction);
+      window.removeEventListener('touchstart', handleFirstInteraction);
+      window.removeEventListener('keydown', handleFirstInteraction);
+    };
+  }, [isAutoplayEnabled, isVolumeEnabled, videoFileUrl]);
+  
+  // Persistent CMS states (agora com id para poder apagar no Supabase)
+  const [galleryImages, setGalleryImages] = useState<{ id: number; url: string }[]>([]);
+
+  // -------- Supabase: carregar dados ao montar --------
+  const loadFromSupabase = useCallback(async () => {
+    // Carregar configurações CMS
+    const { data: settings } = await supabase
+      .from('cms_settings')
+      .select('*')
+      .eq('id', 1)
+      .single();
+
+    if (settings) {
+      setIsAutoplayEnabled(settings.autoplay_enabled ?? false);
+      setIsVolumeEnabled(settings.volume_enabled ?? false);
+      if (settings.video_url) {
+        if (settings.video_url.startsWith('data:')) {
+          setVideoFileUrl(settings.video_url);
+        } else {
+          setVideoLinkUrl(settings.video_url);
+          setVideoFileUrl(settings.video_url);
+        }
+      }
+    }
+
+    // Carregar imagens da galeria
+    const { data: images } = await supabase
+      .from('gallery_images')
+      .select('id, data_url')
+      .order('created_at', { ascending: true });
+
+    if (images) {
+      setGalleryImages(images.map((img: { id: number; data_url: string }) => ({ id: img.id, url: img.data_url })));
+    }
+  }, []);
+
+  useEffect(() => {
+    loadFromSupabase();
+  }, [loadFromSupabase]);
+
+
 
   // Client name from form
   const [clientName, setClientName] = useState<string>("");
@@ -112,13 +230,121 @@ function App() {
     }
   };
 
-  const handleBiPhoto = (
-    e: React.ChangeEvent<HTMLInputElement>,
-    setSide: React.Dispatch<React.SetStateAction<'idle' | 'processing' | 'done'>>
-  ) => {
+  const handleAdminUpload = async (e: React.ChangeEvent<HTMLInputElement>, type: 'photo' | 'video') => {
     if (e.target.files && e.target.files[0]) {
-      setSide('processing');
-      setTimeout(() => setSide('done'), 2000);
+      const file = e.target.files[0];
+      const reader = new FileReader();
+
+      const newFileObj = { type, name: file.name, status: 'uploading' as const };
+      setAdminFiles(prev => [...prev, newFileObj]);
+
+      reader.onloadend = async () => {
+        const base64 = reader.result as string;
+
+        if (type === 'video') {
+          // Para vídeos: guardar base64 para permanência (limite de ~5-10MB por conta do Supabase)
+          setVideoFileUrl(base64);
+          setAdminFiles(prev => prev.map(f => f.name === file.name ? { ...f, status: 'done', data: base64 } : f));
+        } else {
+          // Para fotos: converter em base64 e guardar no Supabase
+          setAdminFiles(prev => prev.map(f => f.name === file.name ? { ...f, status: 'done', data: base64 } : f));
+
+          const { data, error } = await supabase
+            .from('gallery_images')
+            .insert({ data_url: base64 })
+            .select('id, data_url')
+            .single();
+
+          if (!error && data) {
+            setGalleryImages(prev => [...prev, { id: data.id, url: data.data_url }]);
+          } else {
+            console.error('Erro ao guardar imagem no Supabase:', error);
+            alert('Erro ao guardar a imagem. Verifique a ligação ao Supabase.');
+          }
+        }
+      };
+      
+      reader.readAsDataURL(file);
+    }
+  };
+
+  // Função para limpar e converter links (Drive, YouTube, etc)
+  const getProcessedUrl = (url: string) => {
+    if (!url) return "";
+    
+    // Suporte para YouTube (incluindo Shorts)
+    if (url.includes('youtube.com') || url.includes('youtu.be')) {
+      let id = "";
+      if (url.includes('shorts/')) id = url.split('shorts/')[1]?.split('?')[0];
+      else if (url.includes('v=')) id = url.split('v=')[1]?.split('&')[0];
+      else if (url.includes('youtu.be/')) id = url.split('youtu.be/')[1]?.split('?')[0];
+      
+      if (id) {
+        const params = new URLSearchParams({
+          autoplay: isAutoplayEnabled ? '1' : '0',
+          mute: !isVolumeEnabled ? '1' : '0',
+          loop: '1',
+          playlist: id,
+          rel: '0',
+          modestbranding: '1'
+        });
+        return `https://www.youtube.com/embed/${id}?${params.toString()}`;
+      }
+    }
+
+    // Suporte para Google Drive
+    if (url.includes('drive.google.com') || url.includes('docs.google.com')) {
+      const idMatch = url.match(/\/d\/(.+?)\//) || url.match(/id=(.+?)(&|$)/) || url.match(/\/d\/(.+?)$/);
+      const id = idMatch ? idMatch[1] : null;
+      if (id) return `https://drive.google.com/uc?export=download&id=${id}`;
+    }
+    
+    return url;
+  };
+
+  const applyVideoChanges = async () => {
+    try {
+      let finalUrl = videoFileUrl?.startsWith('data:') ? videoFileUrl : (videoLinkUrl || videoFileUrl);
+      finalUrl = getProcessedUrl(finalUrl || "");
+
+      const settingsData = { 
+        id: 1, 
+        autoplay_enabled: isAutoplayEnabled, 
+        volume_enabled: isVolumeEnabled, 
+        video_url: finalUrl || null, 
+        updated_at: new Date().toISOString() 
+      };
+
+      const { error } = await supabase.from('cms_settings').upsert(settingsData);
+
+      if (!error) {
+        setVideoFileUrl(finalUrl);
+        alert(`Sucesso! Configurações guardadas.`);
+      } else {
+        alert(`Erro Supabase: ${error.message}`);
+      }
+    } catch (err: any) {
+      alert('Erro inesperado: ' + err.message);
+    }
+  };
+
+  const handleBiPhoto = (e: React.ChangeEvent<HTMLInputElement>, setStatus: (s: 'idle' | 'processing' | 'done') => void) => {
+    if (e.target.files && e.target.files[0]) {
+      setStatus('processing');
+      // Simulação de processamento/upload
+      setTimeout(() => {
+        setStatus('done');
+      }, 1500);
+    }
+  };
+
+  const handleAdminLogin = (e: React.FormEvent) => {
+    e.preventDefault();
+    // Updated credentials as per user request
+    if (adminLoginForm.username === 'kingleakds@gmail.com' && adminLoginForm.password === 'Albertina198211') {
+      setIsAdminAuthenticated(true);
+    } else {
+      alert('Credenciais Inválidas');
     }
   };
 
@@ -145,6 +371,422 @@ function App() {
 
   return (
     <div style={{ backgroundColor: '#04160f', minHeight: '100vh', color: '#fcfbf8', paddingBottom: '2rem', overflowX: 'hidden' }}>
+      {/* Admin Panel Modal */}
+      <AnimatePresence>
+        {isAdminOpen && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            style={{ 
+              position: 'fixed', top: 0, left: 0, width: '100%', height: '100%', 
+              backgroundColor: 'rgba(2, 8, 6, 0.99)', zIndex: 3000, 
+              padding: 0, overflowY: 'auto', backdropFilter: 'blur(15px)'
+            }}
+          >
+            <div style={{ maxWidth: '900px', margin: '0 auto', minHeight: '100vh', display: 'flex', flexDirection: 'column' }}>
+              {!isAdminAuthenticated ? (
+                <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '1rem' }}>
+                  <motion.div
+                    initial={{ scale: 0.9, opacity: 0, y: 20 }}
+                    animate={{ scale: 1, opacity: 1, y: 0 }}
+                    style={{ 
+                      width: '100%', maxWidth: '420px', padding: '3rem', backgroundColor: '#08120e', 
+                      borderRadius: '2rem', border: '1px solid rgba(245, 158, 11, 0.15)',
+                      boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.5)',
+                      position: 'relative', overflow: 'hidden'
+                    }}
+                  >
+                    <div style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '4px', background: 'linear-gradient(90deg, #f59e0b, #ed8936)' }} />
+                    
+                    <div style={{ marginBottom: '2.5rem', textAlign: 'center' }}>
+                      <div style={{ width: '64px', height: '64px', backgroundColor: 'rgba(245, 158, 11, 0.1)', borderRadius: '1rem', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 1.5rem' }}>
+                        <ShieldCheck size={32} color="#f59e0b" />
+                      </div>
+                      <h2 style={{ fontSize: '1.75rem', color: '#fcfbf8', margin: '0 0 0.5rem 0', fontWeight: 800 }}>Admin Portal</h2>
+                      <p style={{ color: '#94a3b8', fontSize: '0.9rem' }}>Acesso restrito à equipa Gold Services</p>
+                    </div>
+
+                    <form onSubmit={handleAdminLogin} style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
+                      <div className="form-group" style={{ marginBottom: 0 }}>
+                        <label className="form-label" style={{ color: '#94a3b8', fontWeight: 500 }}>Utilizador</label>
+                        <input 
+                          type="text" 
+                          className="form-input" 
+                          style={{ backgroundColor: 'rgba(255,255,255,0.03)', border: '1px solid rgba(245, 158, 11, 0.2)', color: 'white' }}
+                          value={adminLoginForm.username}
+                          onChange={(e) => setAdminLoginForm(prev => ({ ...prev, username: e.target.value }))}
+                          required 
+                        />
+                      </div>
+                      <div className="form-group" style={{ marginBottom: 0, position: 'relative' }}>
+                        <label className="form-label" style={{ color: '#94a3b8', fontWeight: 500 }}>Palavra-passe</label>
+                        <div style={{ position: 'relative' }}>
+                          <input 
+                            type={showAdminPassword ? "text" : "password"} 
+                            className="form-input" 
+                            style={{ backgroundColor: 'rgba(255,255,255,0.03)', border: '1px solid rgba(245, 158, 11, 0.2)', color: 'white', paddingRight: '3rem' }}
+                            value={adminLoginForm.password}
+                            onChange={(e) => setAdminLoginForm(prev => ({ ...prev, password: e.target.value }))}
+                            required 
+                          />
+                          <button
+                            type="button"
+                            onClick={() => setShowAdminPassword(!showAdminPassword)}
+                            style={{ 
+                              position: 'absolute', right: '1rem', top: '50%', transform: 'translateY(-50%)',
+                              background: 'transparent', border: 'none', color: '#94a3b8', cursor: 'pointer', padding: '4px'
+                            }}
+                          >
+                            {showAdminPassword ? <EyeOff size={20} /> : <Eye size={20} />}
+                          </button>
+                        </div>
+                      </div>
+                      <button 
+                        type="submit" 
+                        className="btn-cta" 
+                        style={{ marginTop: '0.5rem', height: '3.5rem', borderRadius: '1rem', fontSize: '1rem' }}
+                      >
+                        Autenticar
+                      </button>
+                      <button 
+                        type="button"
+                        onClick={() => setIsAdminOpen(false)}
+                        style={{ background: 'transparent', color: '#4b5563', fontSize: '0.875rem', border: 'none', cursor: 'pointer', fontWeight: 600 }}
+                      >
+                        Voltar ao Site
+                      </button>
+                    </form>
+                  </motion.div>
+                </div>
+              ) : (
+                <div style={{ padding: '2rem' }}>
+                  {/* Dashboard Header */}
+                  <header style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '3rem', borderBottom: '1px solid rgba(255,255,255,0.05)', paddingBottom: '1.5rem' }}>
+                    <div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px' }}>
+                        <div style={{ width: '8px', height: '8px', borderRadius: '50%', backgroundColor: '#22c55e' }}></div>
+                        <h2 style={{ fontSize: '1.5rem', color: '#fcfbf8', margin: 0, fontWeight: 800 }}>Dashboard CMS</h2>
+                      </div>
+                      <p style={{ margin: 0, fontSize: '0.85rem', color: '#94a3b8' }}>Bem-vindo de volta, Admin</p>
+                    </div>
+                    
+                    <div style={{ display: 'flex', gap: '1rem', alignItems: 'center' }}>
+                      <button 
+                        onClick={() => setIsAdminAuthenticated(false)}
+                        style={{ background: 'rgba(239, 68, 68, 0.1)', color: '#ef4444', border: '1px solid rgba(239, 68, 68, 0.2)', padding: '0.6rem 1.25rem', borderRadius: '0.75rem', fontSize: '0.85rem', fontWeight: 600 }}
+                      >
+                        Sair
+                      </button>
+                      <button 
+                        onClick={() => setIsAdminOpen(false)}
+                        style={{ background: '#f59e0b', color: '#000', border: 'none', padding: '0.6rem 1.25rem', borderRadius: '0.75rem', fontSize: '0.85rem', fontWeight: 700 }}
+                      >
+                        Fechar
+                      </button>
+                    </div>
+                  </header>
+
+                  {/* Tabs Navigation */}
+                  <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '2.5rem', backgroundColor: 'rgba(255,255,255,0.03)', padding: '0.4rem', borderRadius: '1rem', border: '1px solid rgba(255,255,255,0.05)' }}>
+                    {[
+                      { id: 'overview', label: 'Visão Geral', icon: Zap },
+                      { id: 'video', label: 'Vídeo Tutorial', icon: Zap },
+                      { id: 'gallery', label: 'Galeria', icon: Zap },
+                      { id: 'logs', label: 'Registos', icon: Zap }
+                    ].map(tab => (
+                      <button
+                        key={tab.id}
+                        onClick={() => setActiveAdminTab(tab.id as any)}
+                        style={{ 
+                          flex: 1, padding: '0.8rem', borderRadius: '0.75rem', border: 'none', 
+                          backgroundColor: activeAdminTab === tab.id ? '#f59e0b' : 'transparent',
+                          color: activeAdminTab === tab.id ? '#000' : '#94a3b8',
+                          fontWeight: 700, fontSize: '0.85rem', cursor: 'pointer', transition: 'all 0.2s',
+                          display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px'
+                        }}
+                      >
+                        <tab.icon size={16} />
+                        <span className="hide-mobile">{tab.label}</span>
+                      </button>
+                    ))}
+                  </div>
+
+                  {/* Tab Content */}
+                  <motion.div
+                    key={activeAdminTab}
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    transition={{ duration: 0.3 }}
+                  >
+                    {activeAdminTab === 'overview' && (
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: '2rem' }}>
+                        {/* Stats Grid */}
+                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '1.5rem' }}>
+                          <div className="card" style={{ padding: '1.5rem', marginBottom: 0, border: '1px solid rgba(245, 158, 11, 0.1)' }}>
+                            <p style={{ color: '#94a3b8', fontSize: '0.8rem', fontWeight: 600, textTransform: 'uppercase', marginBottom: '0.5rem' }}>Total na Galeria</p>
+                            <h3 style={{ fontSize: '2rem', margin: 0, color: '#f59e0b' }}>{galleryImages.length}</h3>
+                          </div>
+                          <div className="card" style={{ padding: '1.5rem', marginBottom: 0, border: '1px solid rgba(245, 158, 11, 0.1)' }}>
+                            <p style={{ color: '#94a3b8', fontSize: '0.8rem', fontWeight: 600, textTransform: 'uppercase', marginBottom: '0.5rem' }}>Estado do Vídeo</p>
+                            <h3 style={{ fontSize: '1.25rem', margin: 0, color: '#22c55e' }}>Ativo (YT)</h3>
+                          </div>
+                          <div className="card" style={{ padding: '1.5rem', marginBottom: 0, border: '1px solid rgba(245, 158, 11, 0.1)' }}>
+                            <p style={{ color: '#94a3b8', fontSize: '0.8rem', fontWeight: 600, textTransform: 'uppercase', marginBottom: '0.5rem' }}>Segurança</p>
+                            <h3 style={{ fontSize: '1.25rem', margin: 0, color: '#f59e0b' }}>SSL Ativo</h3>
+                          </div>
+                        </div>
+
+                        <div className="card border-gold" style={{ padding: '2rem' }}>
+                          <h3 style={{ marginBottom: '1rem' }}>Resumo de Atividade</h3>
+                          <p style={{ color: '#94a3b8', lineHeight: 1.6 }}>O painel administrativo permite o controlo total sobre os recursos visuais do site. Utilize as abas acima para gerir o vídeo principal e a galeria de fotos.</p>
+                        </div>
+                      </div>
+                    )}
+
+                    {activeAdminTab === 'video' && (
+                      <div className="card border-gold" style={{ padding: '2.5rem' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '2rem' }}>
+                          <div style={{ backgroundColor: 'rgba(245, 158, 11, 0.1)', padding: '10px', borderRadius: '0.75rem' }}>
+                            <Zap size={24} color="#f59e0b" />
+                          </div>
+                          <h3 style={{ margin: 0, fontSize: '1.5rem' }}>Configuração de Vídeo</h3>
+                        </div>
+                        
+                        <div 
+                          onClick={() => document.getElementById('admin-video-upload')?.click()}
+                          style={{ 
+                            backgroundColor: 'rgba(245, 158, 11, 0.03)', border: '2px dashed #f59e0b', 
+                            borderRadius: '1rem', padding: '3rem 1.5rem', textAlign: 'center', cursor: 'pointer',
+                            marginBottom: '1.5rem'
+                          }}
+                        >
+                          <span style={{ fontSize: '2.5rem' }}>🎬</span>
+                          <p style={{ marginTop: '1rem', fontWeight: 700 }}>{videoFileUrl?.startsWith('data:') ? 'Alterar Ficheiro Local' : 'Selecionar Vídeo Local'}</p>
+                          <p style={{ fontSize: '0.8rem', opacity: 0.6 }}>MP4, WebM ou OGG (Base64)</p>
+                          <input id="admin-video-upload" type="file" accept="video/*" hidden onChange={(e) => handleAdminUpload(e, 'video')} />
+                        </div>
+
+                        {/* External Link Input */}
+                        <div style={{ marginBottom: '2rem' }}>
+                          <label style={{ display: 'block', marginBottom: '0.75rem', fontSize: '0.85rem', fontWeight: 700, color: '#f59e0b' }}>
+                            🔗 Link do Google Drive ou Externo (Link Direto)
+                          </label>
+                          <input 
+                            type="text" 
+                            className="form-input" 
+                            placeholder="https://drive.google.com/file/d/..."
+                            value={videoLinkUrl}
+                            onChange={(e) => {
+                              setVideoLinkUrl(e.target.value);
+                              if (e.target.value) {
+                                const direct = getProcessedUrl(e.target.value);
+                                setVideoFileUrl(direct);
+                              }
+                            }}
+                            style={{ backgroundColor: 'rgba(255,255,255,0.03)', border: '1px solid rgba(245, 158, 11, 0.2)', color: 'white' }}
+                          />
+                          <p style={{ fontSize: '0.75rem', color: '#94a3b8', marginTop: '0.5rem' }}>
+                            Dica: Podes colar o link normal do Google Drive. O sistema corrige-o automaticamente!
+                          </p>
+                        </div>
+
+                        {/* Remove Video Button */}
+                        <button 
+                          onClick={() => { setVideoFileUrl(null); setVideoLinkUrl(""); }}
+                          style={{ marginBottom: '2rem', padding: '0.5rem 1rem', background: 'rgba(239, 68, 68, 0.1)', color: '#ef4444', border: '1px solid rgba(239, 68, 68, 0.2)', borderRadius: '0.5rem', cursor: 'pointer', fontSize: '0.8rem' }}
+                        >
+                          🗑️ Limpar Vídeo Atual
+                        </button>
+
+                        {/* Video Controls (Toggles) */}
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem', marginBottom: '2rem' }}>
+                          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '1rem', backgroundColor: 'rgba(255,255,255,0.03)', borderRadius: '0.75rem' }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                              <Zap size={18} color={isAutoplayEnabled ? "#22c55e" : "#4b5563"} />
+                              <div>
+                                <p style={{ margin: 0, fontWeight: 700, fontSize: '0.9rem' }}>Reprodução Automática</p>
+                                <p style={{ margin: 0, fontSize: '0.75rem', color: '#94a3b8' }}>O vídeo inicia sozinho ao aparecer</p>
+                              </div>
+                            </div>
+                            <input 
+                              type="checkbox" 
+                              checked={isAutoplayEnabled} 
+                              onChange={(e) => setIsAutoplayEnabled(e.target.checked)}
+                              style={{ width: '20px', height: '20px', accentColor: '#f59e0b', cursor: 'pointer' }}
+                            />
+                          </div>
+
+                          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '1rem', backgroundColor: 'rgba(255,255,255,0.03)', borderRadius: '0.75rem' }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                              <Zap size={18} color={isVolumeEnabled ? "#f59e0b" : "#4b5563"} />
+                              <div>
+                                <p style={{ margin: 0, fontWeight: 700, fontSize: '0.9rem' }}>Volume Ativo</p>
+                                <p style={{ margin: 0, fontSize: '0.75rem', color: '#94a3b8' }}>O vídeo inicia com som (se permitido pelo browser)</p>
+                              </div>
+                            </div>
+                            <input 
+                              type="checkbox" 
+                              checked={isVolumeEnabled} 
+                              onChange={(e) => setIsVolumeEnabled(e.target.checked)}
+                              style={{ width: '20px', height: '20px', accentColor: '#f59e0b', cursor: 'pointer' }}
+                            />
+                          </div>
+                        </div>
+
+                        <div style={{ marginTop: '2.5rem' }}>
+                          <button 
+                            onClick={applyVideoChanges}
+                            style={{ 
+                              width: '100%', padding: '1.25rem', backgroundColor: '#22c55e', 
+                              color: 'white', border: 'none', borderRadius: '1rem', fontWeight: 800, 
+                              fontSize: '1rem', cursor: 'pointer', display: 'flex', alignItems: 'center', 
+                              justifyContent: 'center', gap: '10px' 
+                            }}
+                          >
+                            💾 Salvar e Aplicar (Autoplay)
+                          </button>
+                        </div>
+
+                        <div style={{ marginTop: '2rem', padding: '1.5rem', backgroundColor: 'rgba(255,255,255,0.03)', borderRadius: '1rem', border: '1px solid rgba(255,255,255,0.05)' }}>
+                          <h4 style={{ margin: '0 0 1rem 0', fontSize: '0.9rem', color: '#f59e0b' }}>📺 Pré-visualização:</h4>
+                          <div style={{ width: '100%', aspectRatio: '9/16', borderRadius: '0.75rem', overflow: 'hidden', backgroundColor: '#000', maxWidth: '300px', margin: '0 auto', position: 'relative' }}>
+                            {videoFileUrl ? (
+                              <>
+                                {videoFileUrl.includes('youtube.com/embed') ? (
+                                  <iframe 
+                                    src={videoFileUrl}
+                                    style={{ width: '100%', height: '100%', border: 'none' }}
+                                    allow="autoplay; encrypted-media"
+                                    allowFullScreen
+                                  />
+                                ) : (
+                                  <audio /> &&
+                                  <video 
+                                    controls 
+                                    onLoadStart={() => setIsVideoLoading(true)}
+                                    onCanPlay={() => setIsVideoLoading(false)}
+                                    onError={() => setIsVideoLoading(false)}
+                                    src={videoFileUrl || undefined} 
+                                    style={{ width: '100%', height: '100%' }}
+                                  />
+                                )}
+                              </>
+                            ) : (
+                              <div style={{ width: '100%', height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#4b5563' }}>
+                                Sem vídeo
+                              </div>
+                            )}
+                          </div>
+                        </div>
+
+                        <div style={{ marginTop: '2rem', padding: '1.5rem', backgroundColor: 'rgba(255,255,255,0.03)', borderRadius: '1rem', border: '1px solid rgba(255,255,255,0.05)' }}>
+                          <p style={{ margin: 0, fontSize: '0.875rem', color: '#94a3b8' }}>
+                            <strong>Nota:</strong> Vídeos em ficheiro são limitados à sessão atual. Para permanência, utilize links externos.
+                          </p>
+                        </div>
+                      </div>
+                    )}
+
+                    {activeAdminTab === 'gallery' && (
+                      <div className="card" style={{ padding: '2.5rem', backgroundColor: '#08120e' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '2rem' }}>
+                          <h3 style={{ margin: 0, fontSize: '1.5rem' }}>Galeria de Media</h3>
+                          <button 
+                            onClick={() => document.getElementById('admin-photo-upload')?.click()}
+                            style={{ backgroundColor: '#f59e0b', color: '#000', border: 'none', padding: '0.75rem 1.5rem', borderRadius: '0.75rem', fontWeight: 800, cursor: 'pointer' }}
+                          >
+                            + Adicionar Foto
+                          </button>
+                        </div>
+
+                        <div 
+                          onClick={() => document.getElementById('admin-photo-upload')?.click()}
+                          style={{ 
+                            backgroundColor: 'rgba(245, 158, 11, 0.03)', border: '2px dashed rgba(245, 158, 11, 0.3)', 
+                            borderRadius: '1.5rem', padding: '4rem 2rem', textAlign: 'center', cursor: 'pointer', marginBottom: '2.5rem'
+                          }}
+                        >
+                          <span style={{ fontSize: '3rem', opacity: 0.5 }}>📂</span>
+                          <p style={{ marginTop: '1rem', fontWeight: 600, color: '#94a3b8' }}>Arraste para aqui ou clique para selecionar fotos</p>
+                          <input id="admin-photo-upload" type="file" accept="image/*" hidden onChange={(e) => handleAdminUpload(e, 'photo')} />
+                        </div>
+
+                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))', gap: '1.5rem' }}>
+                          {galleryImages.map((img) => (
+                            <motion.div 
+                              key={img.id} 
+                              whileHover={{ scale: 1.02 }}
+                              style={{ position: 'relative', borderRadius: '1rem', overflow: 'hidden', aspectRatio: '1/1', border: '1px solid rgba(255,255,255,0.05)' }}
+                            >
+                              <img src={img.url} alt={`Gallery ${img.id}`} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+                              <div style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', background: 'linear-gradient(rgba(0,0,0,0), rgba(0,0,0,0.7))', opacity: 0 }}></div>
+                              <button 
+                                onClick={async () => {
+                                  await supabase.from('gallery_images').delete().eq('id', img.id);
+                                  setGalleryImages(prev => prev.filter(i => i.id !== img.id));
+                                }}
+                                style={{ 
+                                  position: 'absolute', top: '10px', right: '10px', backgroundColor: 'rgba(239, 68, 68, 0.9)', 
+                                  color: 'white', borderRadius: '50%', width: '32px', height: '32px', border: 'none',
+                                  display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer' 
+                                }}
+                              >
+                                <X size={16} />
+                              </button>
+                            </motion.div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {activeAdminTab === 'logs' && (
+                      <div className="card" style={{ padding: '2.5rem' }}>
+                        <h3 style={{ marginBottom: '2rem', fontSize: '1.5rem' }}>Registos do Sistema</h3>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+                          {adminFiles.length === 0 ? (
+                            <div style={{ textAlign: 'center', padding: '4rem 0', color: '#4b5563' }}>
+                              <Zap size={48} style={{ opacity: 0.1, marginBottom: '1rem' }} />
+                              <p>Sem atividade recente para reportar.</p>
+                            </div>
+                          ) : (
+                            adminFiles.map((file, idx) => (
+                              <div key={idx} style={{ 
+                                display: 'flex', alignItems: 'center', gap: '1rem', 
+                                backgroundColor: 'rgba(255,255,255,0.02)', padding: '1.25rem', borderRadius: '1rem',
+                                border: '1px solid rgba(255,255,255,0.05)'
+                              }}>
+                                <div style={{ width: '40px', height: '40px', backgroundColor: 'rgba(245, 158, 11, 0.05)', borderRadius: '0.75rem', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                                  {file.type === 'photo' ? '🖼️' : '🎥'}
+                                </div>
+                                <div style={{ flex: 1 }}>
+                                  <p style={{ margin: 0, fontWeight: 700, fontSize: '0.95rem' }}>{file.name}</p>
+                                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                    <div style={{ width: '6px', height: '6px', borderRadius: '50%', backgroundColor: file.status === 'done' ? '#22c55e' : '#f59e0b' }}></div>
+                                    <span style={{ fontSize: '0.75rem', fontWeight: 600, color: file.status === 'done' ? '#22c55e' : '#f59e0b' }}>
+                                      {file.status === 'done' ? 'Upload verificado e sincronizado' : 'Ficheiro em fila de processamento'}
+                                    </span>
+                                  </div>
+                                </div>
+                                <span style={{ fontSize: '0.7rem', color: '#4b5563', fontWeight: 700 }}>RECENTE</span>
+                              </div>
+                            ))
+                          )}
+                        </div>
+                      </div>
+                    )}
+                  </motion.div>
+
+                  <footer style={{ marginTop: 'auto', paddingTop: '4rem', textAlign: 'center', opacity: 0.3, fontSize: '0.8rem' }}>
+                    Gold Services Management Protocol v2.5.0
+                  </footer>
+                </div>
+              )}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       {/* Floating Notification */}
       <AnimatePresence>
         {notification && (
@@ -251,6 +893,130 @@ function App() {
             Crédito de <span className="text-gold">5.000 a 200.000 MZN</span><br />
             aprovação em até <span className="text-red">8 minutos</span>
           </p>
+
+          {/* Video Section - Vertical Format */}
+          <motion.div 
+            variants={itemVariants}
+            style={{ 
+              margin: '2rem auto',
+              padding: '1rem',
+              backgroundColor: 'rgba(245, 158, 11, 0.05)',
+              borderRadius: '1.5rem',
+              border: '2px solid rgba(245, 158, 11, 0.2)',
+              boxShadow: '0 8px 32px rgba(0, 0, 0, 0.3)',
+              overflow: 'hidden',
+              maxWidth: '360px'
+            }}
+          >
+            <div style={{ 
+              width: '100%', 
+              aspectRatio: '9/16', 
+              backgroundColor: '#08120e',
+              borderRadius: '1rem',
+              border: '1px solid rgba(245, 158, 11, 0.1)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              overflow: 'hidden',
+              position: 'relative'
+            }}>
+              {videoFileUrl?.includes('youtube.com/embed') ? (
+                <iframe 
+                  src={videoFileUrl}
+                  onLoad={() => setIsVideoLoading(false)}
+                  style={{ width: '100%', height: '100%', border: 'none' }}
+                  allow="autoplay; encrypted-media; picture-in-picture"
+                  allowFullScreen
+                />
+              ) : (
+                <video 
+                  ref={videoRef}
+                  key={videoFileUrl || 'no-video'}
+                  muted={!isVolumeEnabled}
+                  playsInline
+                  controls
+                  controlsList="noplaybackrate nodownload"
+                  onLoadStart={() => setIsVideoLoading(true)}
+                  onCanPlay={() => setIsVideoLoading(false)}
+                  onLoadedData={() => setIsVideoLoading(false)}
+                  onError={() => setIsVideoLoading(false)}
+                  src={videoFileUrl || undefined} 
+                  style={{ width: '100%', height: '100%', objectFit: 'cover', borderRadius: '1rem' }}
+                >
+                  Seu navegador não suporta a tag de vídeo.
+                </video>
+              )}
+
+              {/* Loading Overlay com Mensagem Bonita - SEMPRE ATIVO ATÉ CARREGAR */}
+              <AnimatePresence>
+                {isVideoLoading && (
+                  <motion.div 
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    exit={{ opacity: 0 }}
+                    style={{ 
+                      position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', 
+                      backgroundColor: 'rgba(4, 22, 15, 0.98)', zIndex: 10,
+                      display: 'flex', flexDirection: 'column', alignItems: 'center', 
+                      justifyContent: 'center', textAlign: 'center', padding: '1.5rem',
+                      backdropFilter: 'blur(10px)'
+                    }}
+                  >
+                    <motion.div
+                      animate={{ scale: [1, 1.1, 1], opacity: [0.5, 1, 0.5] }}
+                      transition={{ repeat: Infinity, duration: 2 }}
+                      style={{ 
+                        width: '60px', height: '60px', borderRadius: '50%', 
+                        border: '3px solid #f59e0b', borderTopColor: 'transparent',
+                        marginBottom: '1.5rem'
+                      }}
+                    />
+                    <h4 style={{ color: '#f59e0b', margin: '0 0 1rem 0', fontWeight: 800, fontSize: '1.1rem' }}>
+                      A preparar o seu tutorial Gold... 🏆
+                    </h4>
+                    <p style={{ color: 'white', fontSize: '0.85rem', opacity: 0.8, lineHeight: 1.5, margin: 0 }}>
+                      Os seus sonhos estão cada vez mais perto. <br /> 
+                      Aguarde enquanto carregamos a sua próxima etapa. ✨
+                    </p>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </div>
+            <div style={{ 
+              marginTop: '1rem', 
+              display: 'flex', 
+              alignItems: 'center', 
+              justifyContent: 'center', 
+              gap: '8px',
+              color: '#f59e0b'
+            }}>
+              <Zap size={16} />
+              <span style={{ fontSize: '0.9rem', fontWeight: 700, letterSpacing: '0.5px' }}>
+                TUTORIAL: COMO RECEBER O SEU CRÉDITO
+              </span>
+            </div>
+          </motion.div>
+
+          {/* New Photo Gallery Section */}
+          {galleryImages.length > 0 && (
+            <motion.div variants={itemVariants} style={{ margin: '3rem 0' }}>
+              <h2 style={{ fontSize: '1.25rem', fontWeight: 700, textAlign: 'center', marginBottom: '1.5rem', color: '#f59e0b' }}>
+                📸 Galeria de Comprovativos e Serviços
+              </h2>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.75rem' }}>
+                {galleryImages.map((img) => (
+                  <motion.div 
+                    key={img.id}
+                    initial={{ opacity: 0, scale: 0.9 }}
+                    animate={{ opacity: 1, scale: 1 }}
+                    style={{ borderRadius: '1rem', overflow: 'hidden', border: '1px solid rgba(245, 158, 11, 0.2)' }}
+                  >
+                    <img src={img.url} alt={`Gallery ${img.id}`} style={{ width: '100%', display: 'block' }} />
+                  </motion.div>
+                ))}
+              </div>
+            </motion.div>
+          )}
           <motion.button
             className="btn-cta"
             whileHover={{ scale: 1.02 }}
@@ -805,7 +1571,10 @@ function App() {
             </div>
           </div>
 
-          <div style={{ textAlign: 'center', marginTop: '4rem', fontSize: '10px', color: '#333' }}>
+          <div 
+            onClick={() => setIsAdminOpen(true)}
+            style={{ textAlign: 'center', marginTop: '4rem', fontSize: '10px', color: '#333', cursor: 'pointer', padding: '1rem' }}
+          >
             © 2024 Gold Services. Todos os direitos reservados.
             <br />
             Processamos o seu pedido em tempo recorde.
