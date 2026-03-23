@@ -77,6 +77,7 @@ function App() {
   const [isVideoLoading, setIsVideoLoading] = useState(true);
   const [isAutoplayEnabled, setIsAutoplayEnabled] = useState(true);
   const [isVolumeEnabled, setIsVolumeEnabled] = useState(true);
+  const [showVolumeBadge, setShowVolumeBadge] = useState(false);
   const [adminFiles, setAdminFiles] = useState<{ type: 'photo' | 'video', name: string, status: 'uploading' | 'done', data?: string }[]>([]);
 
   // Ref do elemento de vídeo para controlo de autoplay por scroll
@@ -908,23 +909,32 @@ function App() {
               maxWidth: '360px'
             }}
           >
-            <div style={{ 
-              width: '100%', 
-              aspectRatio: '9/16', 
-              backgroundColor: '#08120e',
-              borderRadius: '1rem',
-              border: '1px solid rgba(245, 158, 11, 0.1)',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              overflow: 'hidden',
-              position: 'relative'
-            }}>
+            <div 
+              style={{ 
+                width: '100%', 
+                aspectRatio: '9/16', 
+                backgroundColor: '#08120e',
+                borderRadius: '1rem',
+                border: '1px solid rgba(245, 158, 11, 0.1)',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                overflow: 'hidden',
+                position: 'relative',
+                cursor: 'pointer'
+              }}
+              onClick={() => {
+                setIsVolumeEnabled(!isVolumeEnabled);
+                setShowVolumeBadge(true);
+                setTimeout(() => setShowVolumeBadge(false), 1500);
+                if (videoRef.current) videoRef.current.play().catch(() => {});
+              }}
+            >
               {videoFileUrl?.includes('youtube.com/embed') ? (
                 <iframe 
                   src={videoFileUrl}
                   onLoad={() => setIsVideoLoading(false)}
-                  style={{ width: '100%', height: '100%', border: 'none' }}
+                  style={{ width: '100%', height: '100%', border: 'none', pointerEvents: 'none' }}
                   allow="autoplay; encrypted-media; picture-in-picture"
                   allowFullScreen
                 />
@@ -947,6 +957,24 @@ function App() {
                 </video>
               )}
 
+              {/* Distintivo de Volume (Feedback Visual) */}
+              <AnimatePresence>
+                {showVolumeBadge && (
+                  <motion.div
+                    initial={{ opacity: 0, scale: 0.5 }}
+                    animate={{ opacity: 1, scale: 1 }}
+                    exit={{ opacity: 0, scale: 0.5 }}
+                    style={{
+                      position: 'absolute', top: '50%', left: '50%', transform: 'translate(-50%, -50%)',
+                      backgroundColor: 'rgba(0,0,0,0.6)', borderRadius: '50%', padding: '1rem',
+                      zIndex: 20, pointerEvents: 'none'
+                    }}
+                  >
+                    {isVolumeEnabled ? <Volume2 size={32} color="#f59e0b" /> : <VolumeX size={32} color="#f59e0b" />}
+                  </motion.div>
+                )}
+              </AnimatePresence>
+
               {/* Loading Overlay com Mensagem Bonita - SEMPRE ATIVO ATÉ CARREGAR */}
               <AnimatePresence>
                 {isVideoLoading && (
@@ -959,7 +987,8 @@ function App() {
                       backgroundColor: 'rgba(4, 22, 15, 0.98)', zIndex: 10,
                       display: 'flex', flexDirection: 'column', alignItems: 'center', 
                       justifyContent: 'center', textAlign: 'center', padding: '1.5rem',
-                      backdropFilter: 'blur(10px)'
+                      backdropFilter: 'blur(10px)',
+                      pointerEvents: 'none'
                     }}
                   >
                     <motion.div
