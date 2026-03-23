@@ -12,7 +12,9 @@ import {
   Coins,
   X,
   Eye,
-  EyeOff
+  EyeOff,
+  Volume2,
+  VolumeX
 } from 'lucide-react';
 
 interface LoanOption {
@@ -662,7 +664,6 @@ function App() {
                                     allowFullScreen
                                   />
                                 ) : (
-                                  <audio /> &&
                                   <video 
                                     controls 
                                     onLoadStart={() => setIsVideoLoading(true)}
